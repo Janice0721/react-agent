@@ -1,6 +1,21 @@
 server:
   port: 9999
 
+spring:
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/react_agent?useSSL=false&serverTimezone=Asia/Shanghai&createDatabaseIfNotExist=true
+    username: root
+    password: root_password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
 agent:
   model:
     base-url: http://oneai.17usoft.com/v1
@@ -10,3 +25,14 @@ agent:
     timeout: 600
   skill:
     base-dir: /Users/user/Desktop/react-agent/react-agent-skills/src/main/resources/skills
+  memory:
+    short-term-limit: 20
+    compress-threshold: 8000
+    compress-keep-recent: 6
+    long-term-top-k: 5
+    qdrant:
+      host: 127.0.0.1
+      port: 6334
+      collection-name: react_agent_memory
+      vector-dimension: 1536
+      enabled: true

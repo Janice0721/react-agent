@@ -51,6 +51,10 @@
             <groupId>com.reactagent</groupId>
             <artifactId>react-agent-skills</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.reactagent</groupId>
+            <artifactId>react-agent-memory</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

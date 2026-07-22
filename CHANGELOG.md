@@ -77,6 +77,28 @@
 - 内置 3 个示例技能：code-review、data-analysis、document-writing
 - 技能自定义说明文档
 
+### 新增 — 分层记忆 (react-agent-memory)
+- 三层记忆架构，接口可扩展，后续可演进为中心化记忆服务
+- `MemoryManager` 总管接口：buildContext/consolidate/clearSession/compressContext
+- `ShortTermMemory` 短期记忆：MySQL 落库，按会话维度持久化
+  - `ShortTermMemoryImpl` + `MessageRepository`(JDBC) + `MessageEntity`
+  - `MsgSerializer` Msg ↔ Entity 序列化
+  - 支持重启恢复、token 估算、旧消息提取
+- `MidTermMemory` 中期记忆：Redis 存储会话级摘要
+  - `MidTermMemoryImpl`，key=session:{id}:midterm，TTL 24h
+  - `MemorySummary` 摘要模型
+- `LongTermMemory` 长期记忆：Qdrant 向量数据库
+  - `QdrantLongTermMemory`：store/search/delete/clear
+  - 自动 embedding + 余弦相似度检索 + 按 userId 隔离
+  - Qdrant 未启动时可降级(enabled=false)
+- `MemoryManagerImpl` 总管实现：
+  - buildContext()：中期摘要 + 长期检索注入 + 短期原文
+  - consolidate()：LLM 提取关键信息 → 存 Qdrant
+  - compressContext()：token 超阈值 → LLM 摘要 → 存 Redis
+- `MemoryProperties` 配置属性绑定(agent.memory.*)
+- `MemoryConfig` Spring 配置(QdrantClient Bean)
+- 建表脚本 schema.sql(agent_message + agent_session 表)
+
 ### 新增 — 服务层 (react-agent-server)
 - `ReactAgentApplication`：Spring Boot 启动类
 - `application.yml`：模型配置 + 服务端口
@@ -89,5 +111,5 @@
 - `docs/EXECUTION_PLAN.md`：详细执行计划（1587 行，11 阶段 + 附录代码）
 
 ### 已知问题
-- react-agent-memory、react-agent-hitl、react-agent-runtime、react-agent-example 模块尚未实现，保留骨架
+- react-agent-hitl、react-agent-runtime、react-agent-example 模块尚未实现，保留骨架
 - 未配置 git 账户信息（本次提交修复）
