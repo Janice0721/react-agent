@@ -1,0 +1,33 @@
+# === Java / Maven ===
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# === IDE ===
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+*.sublime-*
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === 日志 ===
+*.log
+logs/
+
+# === 环境配置(不提交密钥) ===
+*.env
+application-local.yml
+
+# === Maven ===
+pom.xml.versionsBackup
+.releaseBackup

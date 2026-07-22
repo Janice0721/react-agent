@@ -1,0 +1,12 @@
+server:
+  port: 9999
+
+agent:
+  model:
+    base-url: http://oneai.17usoft.com/v1
+    api-key: sk-b93d546a-2682-11f1-8162-2a45380e9928
+    model: deepseek-v4-pro
+    embedding-model: text-embedding-v4
+    timeout: 600
+  skill:
+    base-dir: /Users/user/Desktop/react-agent/react-agent-skills/src/main/resources/skills
