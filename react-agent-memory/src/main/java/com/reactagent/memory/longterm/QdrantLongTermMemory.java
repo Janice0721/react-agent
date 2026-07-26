@@ -7,6 +7,8 @@ import com.reactagent.memory.api.LongTermMemory;
 import com.reactagent.model.ModelAdapter;
 import io.qdrant.client.QdrantClient;
 import io.qdrant.client.ValueFactory;
+import io.qdrant.client.grpc.Collections.CollectionInfo;
+import io.qdrant.client.grpc.Collections.VectorsConfig;
 import io.qdrant.client.grpc.Collections.Distance;
 import io.qdrant.client.grpc.Collections.VectorParams;
 import io.qdrant.client.grpc.Points.Condition;
@@ -17,9 +19,13 @@ import io.qdrant.client.grpc.Points.PointId;
 import io.qdrant.client.grpc.Points.PointStruct;
 import io.qdrant.client.grpc.Points.ScoredPoint;
 import io.qdrant.client.grpc.Points.SearchPoints;
+import io.qdrant.client.grpc.Points.RetrievedPoint;
+import io.qdrant.client.grpc.Points.ScrollPoints;
+import io.qdrant.client.grpc.Points.ScrollResponse;
 import io.qdrant.client.grpc.Points.Vector;
 import io.qdrant.client.grpc.Points.Vectors;
 import io.qdrant.client.grpc.Points.WithPayloadSelector;
+import io.qdrant.client.grpc.Points.WithVectorsSelector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,25 +59,56 @@ public class QdrantLongTermMemory implements LongTermMemory {
         this.vectorDimension = vectorDimension;
     }
 
-    /** 初始化:确保 collection 存在。 */
+    /**
+     * 初始化:确保 collection 存在且向量维度与配置一致。
+     * 维度不一致(例如更换 embedding 模型)会删除并重建集合,
+     * 避免后续 store 因维度不匹配而静默失败。
+     */
     public void init() {
         try {
             List<String> collections = qdrantClient.listCollectionsAsync(java.time.Duration.ofSeconds(10)).get();
             if (!collections.contains(collectionName)) {
-                qdrantClient.createCollectionAsync(
-                    collectionName,
-                    VectorParams.newBuilder()
-                        .setSize(vectorDimension)
-                        .setDistance(Distance.Cosine)
-                        .build()
-                ).get();
-                log.info("Qdrant collection 已创建: {} 维度={}", collectionName, vectorDimension);
+                createCollection();
+                return;
+            }
+            // collection 存在,校验维度
+            int existingDim = extractExistingDimension();
+            if (existingDim > 0 && existingDim != vectorDimension) {
+                log.warn("Qdrant collection 维度不匹配: existing={} expected={},删除并重建集合: {}",
+                        existingDim, vectorDimension, collectionName);
+                qdrantClient.deleteCollectionAsync(collectionName).get();
+                createCollection();
             } else {
-                log.info("Qdrant collection 已存在: {}", collectionName);
+                log.info("Qdrant collection 已存在且维度匹配: {} 维度={}", collectionName,
+                        existingDim > 0 ? existingDim : vectorDimension);
             }
         } catch (Exception e) {
             log.warn("Qdrant 初始化失败(如果 Qdrant 未启动会跳过): {}", e.getMessage());
         }
+    }
+
+    private void createCollection() throws Exception {
+        qdrantClient.createCollectionAsync(collectionName,
+                VectorParams.newBuilder()
+                        .setSize(vectorDimension)
+                        .setDistance(Distance.Cosine)
+                        .build()
+        ).get();
+        log.info("Qdrant collection 已创建: {} 维度={}", collectionName, vectorDimension);
+    }
+
+    /** 读取已存在 collection 的向量维度,无法读取返回 -1。 */
+    private int extractExistingDimension() {
+        try {
+            CollectionInfo info = qdrantClient.getCollectionInfoAsync(collectionName).get();
+            VectorsConfig vc = info.getConfig().getParams().getVectorsConfig();
+            if (vc.getConfigCase() == VectorsConfig.ConfigCase.PARAMS) {
+                return (int) vc.getParams().getSize();
+            }
+        } catch (Exception e) {
+            log.debug("提取现有维度失败: {}", e.getMessage());
+        }
+        return -1;
     }
 
     @Override
@@ -114,7 +151,9 @@ public class QdrantLongTermMemory implements LongTermMemory {
 
             log.info("长期记忆存储: userId={} contentLen={}", safeUserId, content.length());
         } catch (Exception e) {
-            log.error("长期记忆存储失败: msgId={}", msg.getId(), e);
+            log.error("长期记忆存储失败: msgId={} contentLen={} expectedDim={} error={}",
+                    msg.getId(), content.length(), vectorDimension,
+                    e.getMessage());
         }
     }
 
@@ -170,8 +209,47 @@ public class QdrantLongTermMemory implements LongTermMemory {
 
     @Override
     public List<Msg> getAll(String userId) {
-        log.warn("getAll 暂未实现,建议使用 search 进行语义检索");
-        return List.of();
+        List<Msg> results = new ArrayList<>();
+        try {
+            String safeUserId = userId != null ? userId : "default";
+            Filter filter = Filter.newBuilder()
+                .addMust(Condition.newBuilder()
+                    .setField(FieldCondition.newBuilder()
+                        .setKey("userId")
+                        .setMatch(Match.newBuilder().setKeyword(safeUserId).build())
+                        .build())
+                    .build())
+                .build();
+            // 分页 scroll,避免一次性拉取过多
+            PointId offset = null;
+            int pageSize = 100;
+            while (true) {
+                ScrollPoints.Builder sp = ScrollPoints.newBuilder()
+                    .setCollectionName(collectionName)
+                    .setFilter(filter)
+                    .setLimit(pageSize)
+                    .setWithPayload(WithPayloadSelector.newBuilder().setEnable(true).build())
+                    .setWithVectors(WithVectorsSelector.newBuilder().setEnable(false).build());
+                if (offset != null) sp.setOffset(offset);
+                ScrollResponse resp = qdrantClient.scrollAsync(sp.build()).get();
+                for (RetrievedPoint point : resp.getResultList()) {
+                    String content = extractPayloadValue(point.getPayloadMap(), "content");
+                    String sessionId = extractPayloadValue(point.getPayloadMap(), "sessionId");
+                    String createdAt = extractPayloadValue(point.getPayloadMap(), "createdAt");
+                    Msg msg = Msg.user(sessionId, "memory", content);
+                    msg.setId(point.getId().getUuid());
+                    msg.setCreatedAt(createdAt);
+                    results.add(msg);
+                }
+                if (!resp.hasNextPageOffset()) break;
+                offset = resp.getNextPageOffset();
+            }
+            log.info("长期记忆全量读取: userId={} results={}", safeUserId, results.size());
+            return results;
+        } catch (Exception e) {
+            log.error("长期记忆全量读取失败: userId={}", userId, e);
+            return results;
+        }
     }
 
     @Override
@@ -221,6 +299,17 @@ public class QdrantLongTermMemory implements LongTermMemory {
     private String extractPayload(ScoredPoint point, String key) {
         try {
             return point.getPayloadMap().get(key).getStringValue();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** 从 payload map 中提取字符串字段,兼容 ScoredPoint / RetrievedPoint。 */
+    private String extractPayloadValue(
+            java.util.Map<String, io.qdrant.client.grpc.JsonWithInt.Value> map, String key) {
+        try {
+            io.qdrant.client.grpc.JsonWithInt.Value v = map.get(key);
+            return v != null ? v.getStringValue() : "";
         } catch (Exception e) {
             return "";
         }

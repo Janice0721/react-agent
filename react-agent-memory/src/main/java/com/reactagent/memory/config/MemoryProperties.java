@@ -36,7 +36,7 @@ public class MemoryProperties {
         /** Collection 名称 */
         private String collectionName = "react_agent_memory";
         /** 向量维度(需与 embedding 模型一致) */
-        private int vectorDimension = 1536;
+        private int vectorDimension = 1024;
         /** 是否启用长期记忆(Qdrant 未启动时设为 false) */
         private boolean enabled = true;
     }

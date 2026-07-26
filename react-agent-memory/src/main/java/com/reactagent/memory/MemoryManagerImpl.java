@@ -1,6 +1,7 @@
 package com.reactagent.memory;
 
 import com.reactagent.core.msg.Msg;
+import com.reactagent.core.msg.Role;
 import com.reactagent.core.msg.block.HintBlock;
 import com.reactagent.core.msg.block.TextBlock;
 import com.reactagent.memory.api.LongTermMemory;
@@ -59,30 +60,34 @@ public class MemoryManagerImpl implements MemoryManager {
     public List<Msg> buildContext(String sessionId, String userId, String currentQuery) {
         List<Msg> context = new ArrayList<>();
 
-        // 1. 注入中期记忆摘要(如果有)
+        // 1. 注入中期记忆摘要(如果有) — 单条 system 消息
         String summaryText = midTerm.getSummaryText(sessionId);
         if (summaryText != null && !summaryText.isBlank()) {
             Msg summaryMsg = Msg.system(sessionId, summaryText);
             context.add(summaryMsg);
         }
 
-        // 2. 注入长期记忆检索结果(如果有查询)
+        // 2. 注入长期记忆检索结果 — 合并为单条 system 消息(含多个 HintBlock)
         if (currentQuery != null && !currentQuery.isBlank()) {
             try {
                 List<Msg> memories = longTerm.search(
                         currentQuery, userId, properties.getLongTermTopK());
-                for (Msg mem : memories) {
-                    HintBlock hint = new HintBlock();
-                    hint.setHint(mem.getTextContent());
-                    hint.setSource("long_term_memory");
-                    Msg hintMsg = new Msg();
-                    hintMsg.setId(UUID.randomUUID().toString());
-                    hintMsg.setSessionId(sessionId);
-                    hintMsg.setName("memory");
-                    hintMsg.setRole(com.reactagent.core.msg.Role.USER);
-                    hintMsg.setContent(new ArrayList<>(List.of(hint)));
-                    hintMsg.setCreatedAt(Instant.now().toString());
-                    context.add(hintMsg);
+                if (!memories.isEmpty()) {
+                    List<HintBlock> hintBlocks = new ArrayList<>();
+                    for (Msg mem : memories) {
+                        HintBlock hint = new HintBlock();
+                        hint.setHint(mem.getTextContent());
+                        hint.setSource("long_term_memory");
+                        hintBlocks.add(hint);
+                    }
+                    Msg memoryMsg = new Msg();
+                    memoryMsg.setId(UUID.randomUUID().toString());
+                    memoryMsg.setSessionId(sessionId);
+                    memoryMsg.setName("memory");
+                    memoryMsg.setRole(Role.SYSTEM);
+                    memoryMsg.setContent(new ArrayList<>(hintBlocks));
+                    memoryMsg.setCreatedAt(Instant.now().toString());
+                    context.add(memoryMsg);
                 }
                 log.debug("长期记忆注入: {} 条", memories.size());
             } catch (Exception e) {
@@ -166,16 +171,17 @@ public class MemoryManagerImpl implements MemoryManager {
      * 上下文压缩:旧消息 → LLM 摘要 → 存入中期记忆。
      * 由 ContextCompactor 调用。
      */
-    public void compressContext(String sessionId) {
+    @Override
+    public boolean compressContext(String sessionId) {
         int tokens = shortTerm.estimateTokens(sessionId);
         if (tokens <= properties.getCompressThreshold()) {
-            return;  // 未超阈值,不需要压缩
+            return false;  // 未超阈值,不需要压缩
         }
 
         // 取出旧消息(保留最近 K 条)
         List<Msg> oldMsgs = shortTerm.takeOldMessages(
                 sessionId, properties.getCompressKeepRecent());
-        if (oldMsgs.isEmpty()) return;
+        if (oldMsgs.isEmpty()) return false;
 
         try {
             // 调 LLM 生成摘要
@@ -197,11 +203,16 @@ public class MemoryManagerImpl implements MemoryManager {
                         .createdAt(Instant.now().toString())
                         .build();
                 midTerm.store(sessionId, summary);
-                log.info("上下文压缩: session={} 旧消息={} 摘要已存入中期记忆",
-                        sessionId, oldMsgs.size());
+                // 摘要成功后才删除旧消息,避免压缩失败丢数据
+                int deleted = shortTerm.deleteOlder(sessionId, properties.getCompressKeepRecent());
+                log.info("上下文压缩: session={} 旧消息={} 摘要已存入中期记忆,删除短期记忆 {} 条",
+                        sessionId, oldMsgs.size(), deleted);
+                return true;
             }
+            return false;
         } catch (Exception e) {
             log.error("上下文压缩失败: session={}", sessionId, e);
+            return false;
         }
     }
 

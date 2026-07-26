@@ -34,5 +34,5 @@ agent:
       host: 127.0.0.1
       port: 6334
       collection-name: react_agent_memory
-      vector-dimension: 1536
+      vector-dimension: 1024
       enabled: true

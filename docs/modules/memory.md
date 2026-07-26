@@ -78,7 +78,7 @@ com.reactagent.memory
 | `estimateTokens(sessionId)` | 估算当前会话 token 数 |
 | `consolidate(sessionId, userId, finalReply)` | 会话结束沉淀：LLM 提取关键信息 → 存 Qdrant |
 | `clearSession(sessionId, userId)` | 清除会话全部记忆（短/中/长） |
-| `compressContext(sessionId)` | 上下文压缩：token 超阈值 → 旧消息 LLM 摘要 → 存 Redis |
+| `compressContext(sessionId)` → `boolean` | 上下文压缩：token 超阈值 → 旧消息 LLM 摘要 → 存 Redis → 删除已摘要短期消息；返回是否触发 |
 
 ### ShortTermMemory（短期记忆）
 
@@ -88,8 +88,9 @@ com.reactagent.memory
 | `getRecent(sessionId, limit)` | 获取最近 N 条 |
 | `getAll(sessionId)` | 获取全部 |
 | `count(sessionId)` | 消息总数 |
-| `estimateTokens(sessionId)` | token 估算（字符数/4） |
-| `takeOldMessages(sessionId, keepRecent)` | 取出旧消息用于压缩 |
+| `estimateTokens(sessionId)` | token 估算（DB 侧 SUM 字符数/4，避免全量加载） |
+| `takeOldMessages(sessionId, keepRecent)` | 取出旧消息（不删除，用于压缩前预览） |
+| `deleteOlder(sessionId, keepRecent)` | 删除较早消息仅保留最近 keepRecent 条（压缩后真正收缩上下文） |
 | `clear(sessionId)` | 清除会话消息 |
 
 ### MidTermMemory（中期记忆）
@@ -141,10 +142,11 @@ session:{sessionId}:midterm  →  摘要列表 JSON  (TTL 24h)
 
 ```
 Collection: react_agent_memory
-向量维度: 1536 (与 embedding 模型一致)
+向量维度: 1024 (与 embedding 模型 text-embedding-v4 一致;init() 启动时自动校验,不匹配则重建)
 距离: Cosine
 Payload: content / userId / sessionId / createdAt / msgId
 检索过滤: 按 userId 隔离
+全量读取: getAll(userId) 走 scroll 分页(每页 100)
 ```
 
 ## 配置
@@ -156,7 +158,7 @@ spring:
   datasource:
     url: jdbc:mysql://localhost:3306/react_agent?useSSL=false&serverTimezone=Asia/Shanghai&createDatabaseIfNotExist=true
     username: root
-    password: root
+    password: root_password
     driver-class-name: com.mysql.cj.jdbc.Driver
   data:
     redis:
@@ -177,7 +179,7 @@ agent:
       host: ${QDRANT_HOST:localhost}
       port: ${QDRANT_PORT:6334}
       collection-name: react_agent_memory
-      vector-dimension: 1536                # 需与 embedding 模型一致
+      vector-dimension: 1024                # 需与 embedding 模型一致;init 自动校验
       enabled: ${QDRANT_ENABLED:true}       # Qdrant 未启动时设 false 降级
 ```
 
@@ -225,9 +227,9 @@ public class MyService {
         memoryManager.addShortTerm(reply);
 
         // 5. 上下文过长时压缩（token 超阈值自动触发）
-        //    旧消息 → LLM 摘要 → 存 Redis 中期记忆
+        //    旧消息 → LLM 摘要 → 存 Redis 中期记忆 → 删除已摘要的短期消息
         if (memoryManager.estimateTokens(sessionId) > 8000) {
-            ((MemoryManagerImpl) memoryManager).compressContext(sessionId);
+            memoryManager.compressContext(sessionId);   // 已在接口,无需强转;返回是否触发
         }
     }
 
@@ -245,7 +247,7 @@ public class MyService {
 
 ```
 1. [system] 中期记忆摘要（如果有，来自 Redis）
-2. [user/hint] 长期记忆检索结果（如果有，来自 Qdrant 语义检索 top-5）
+2. [system] 长期记忆检索结果（如果有，合并为单条 system 消息，含多个 HintBlock，来自 Qdrant 语义检索 top-5）
 3. [user/assistant/...] 短期记忆原文（最近 20 条，来自 MySQL）
 ```
 
@@ -292,3 +294,67 @@ public class MyService {
 - mysql-connector-j
 - io.qdrant:client（Qdrant）
 - com.google.protobuf / com.google.guava（Qdrant 间接依赖）
+
+## 优化记录（2026-07-27 自测修复）
+
+自测发现并修复了以下问题，新增 3 个回归测试 + 2 个适配器单元测试，全部 13 个测试通过。
+
+### 1. 严重：长期记忆对模型不可见（已修复）
+
+- **现象**：`buildContext` 注入的长期记忆以 `HintBlock` 承载，但 `OpenAICompatibleAdapter` 序列化消息时只读取 `TextBlock`，`HintBlock` 内容被丢弃 → 模型实际收不到长期记忆。
+- **修复**：
+  - `OpenAICompatibleAdapter.toOpenAIMessage` 增加 `HintBlock` 序列化，带 `[来源]` 标签拼入 `content`。
+  - `MemoryManagerImpl.buildContext` 将多条长期记忆合并为**单条 system 消息**（含多个 HintBlock），减少消息噪音、语义更正确（原为 role=USER 的多条空消息）。
+- **回归测试**：`HintBlockSerializationTest`（反射校验序列化体 content 含 hint 原文与来源标签）；`testBuildContext` 增断言「含『张三』的 HintBlock 必须存在」。
+
+### 2. 重要：上下文压缩不收缩（已修复）
+
+- **现象**：`compressContext` 取出旧消息生成摘要存入中期记忆后，**没有删除**短期记忆中的旧消息 → 上下文只增不减，长任务上下文压缩失效。
+- **修复**：
+  - `MessageRepository` / `ShortTermMemory` 新增 `deleteOlder(sessionId, keepRecent)`。
+  - `compressContext` 摘要成功后才调用 `deleteOlder`，避免压缩失败丢数据。
+  - `compressContext` 返回值改为 `boolean`（是否触发压缩），并提升到 `MemoryManager` 接口（原为 impl 的 public 方法，运行时无法通过接口调用）。
+- **回归测试**：`testShortTermDeleteOlder`、`testCompressContextNoOp`。
+
+### 3. 健壮性：Qdrant 维度不一致静默失败（已修复）
+
+- **现象**：更换 embedding 模型导致向量维度变化时，已存在的 collection 维度不匹配，`store()` 会静默失败。
+- **修复**：`QdrantLongTermMemory.init()` 启动时用 `getCollectionInfoAsync` 读取现有 collection 维度，与配置不一致则删除并重建，并打印告警。
+
+### 4. 完善性：长期记忆全量读取（已实现）
+
+- **现象**：`LongTermMemory.getAll(userId)` 原为空实现，仅建议用 search。
+- **修复**：用 Qdrant scroll API 分页实现（每页 100，按 userId 过滤），供管理后台/调试使用。
+- **回归测试**：`testLongTermGetAll`。
+
+### 5. 性能：短期记忆 token 估算（已优化）
+
+- **现象**：`estimateTokens` 全量加载会话所有 `MessageEntity` 到内存再求字符和。
+- **修复**：改为 `MessageRepository.sumContentLength` 走 DB 侧 `SUM(CHAR_LENGTH(content))` 聚合，避免全量加载。
+
+### 测试覆盖
+
+| 测试 | 模块 | 类型 | 覆盖点 |
+|---|---|---|---|
+| `HintBlockSerializationTest` | model | 单元 | HintBlock 序列化对模型可见 |
+| `testShortTermDeleteOlder` | memory | 集成 | 压缩删除机制 |
+| `testLongTermGetAll` | memory | 集成 | scroll 全量读取 |
+| `testCompressContextNoOp` | memory | 集成 | 低 token 不压缩 |
+| `testBuildContext`（增强） | memory | 集成 | 长期记忆 HintBlock 注入 |
+
+运行命令：
+```bash
+# JDK 21 编译 + 跑记忆集成测试（需 MySQL/Redis/Qdrant 在运行）
+mvn -pl react-agent-server -am test -Dtest=MemoryModuleTest -Dsurefire.failIfNoSpecifiedTests=false
+
+# 仅跑适配器序列化单元测试（无需外部服务）
+mvn -pl react-agent-model test -Dtest=HintBlockSerializationTest -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+### 后续可继续优化（未本轮处理）
+
+- `MsgSerializer` 手动解析 ContentBlock JSON：建议给 `ContentBlock` 加 `@JsonTypeInfo`，用多态反序列化替代字段名猜测。
+- `MidTermMemory` 读-改-写非原子：并发场景可改 Redis List 或事务。
+- 短期记忆可叠加内存缓存层（Caffeine）减少 DB 压力。
+- `consolidate()` 尚无自动化测试（需真实 LLM 调用），建议后续补 Mock 测试。
+- 向中心化记忆服务演进时，`MemoryManager` 实现改为 HTTP/gRPC 客户端即可。

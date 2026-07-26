@@ -10,6 +10,16 @@
 
 ### 新增
 - 项目基础文档：README、SETUP、TECHNICAL_DESIGN、EXECUTION_PLAN
+### 变更 — 记忆模块自测修复 (2026-07-27)
+- 严重修复：`OpenAICompatibleAdapter` 只序列化 `TextBlock`，导致 `HintBlock` 承载的长期记忆对模型不可见；现已序列化 `HintBlock`（带来源标签）
+- 严重修复：`MemoryManagerImpl.buildContext` 将多条长期记忆合并为单条 system 消息（原为多条 role=USER 空消息）
+- 重要修复：`compressContext` 摘要后未删除旧消息，上下文只增不减；新增 `deleteOlder`，摘要成功后才删除
+- 重要修复：`compressContext`/`consolidate` 提升到 `MemoryManager` 接口（原为 impl public 方法，运行时无法经接口调用）
+- 健壮性：`QdrantLongTermMemory.init()` 启动时校验 collection 向量维度，不一致则删除重建
+- 完善：`LongTermMemory.getAll(userId)` 用 Qdrant scroll API 分页实现（原为空实现）
+- 性能：`estimateTokens` 改走 DB 侧 `SUM(CHAR_LENGTH(content))`，避免全量加载
+- 测试：新增 `HintBlockSerializationTest`(2) + 记忆集成测试 3 个，共 13 个测试全部通过
+
 
 ---
 

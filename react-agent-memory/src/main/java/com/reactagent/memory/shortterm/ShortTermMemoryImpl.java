@@ -60,13 +60,8 @@ public class ShortTermMemoryImpl implements ShortTermMemory {
 
     @Override
     public int estimateTokens(String sessionId) {
-        // 粗略估算:字符数 / 4
-        List<MessageEntity> all = repository.findAll(sessionId);
-        int chars = 0;
-        for (MessageEntity e : all) {
-            if (e.getContentJson() != null) chars += e.getContentJson().length();
-        }
-        return chars / 4;
+        // 粗略估算:content 字符数 / 4(走 DB 聚合,避免全量加载)
+        return repository.sumContentLength(sessionId) / 4;
     }
 
     @Override
@@ -74,6 +69,15 @@ public class ShortTermMemoryImpl implements ShortTermMemory {
         return repository.findOld(sessionId, keepRecent).stream()
                 .map(MsgSerializer::toMsg)
                 .toList();
+    }
+
+    @Override
+    public int deleteOlder(String sessionId, int keepRecent) {
+        int deleted = repository.deleteOlder(sessionId, keepRecent);
+        if (deleted > 0) {
+            log.info("短期记忆压缩: session={} 删除 {} 条旧消息", sessionId, deleted);
+        }
+        return deleted;
     }
 
     @Override

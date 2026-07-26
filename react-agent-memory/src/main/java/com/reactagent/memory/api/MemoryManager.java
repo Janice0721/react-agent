@@ -32,6 +32,14 @@ public interface MemoryManager {
      */
     void consolidate(String sessionId, String userId, Msg finalReply);
 
+    /**
+     * 上下文压缩:当短期记忆 token 超阈值时,将较早的消息摘要后存入中期记忆,
+     * 并从短期记忆中删除已摘要的旧消息,真正收缩上下文。
+     * 由 ReAct 循环或 ContextCompactor 在长任务中按需触发。
+     * @return 是否触发了压缩
+     */
+    boolean compressContext(String sessionId);
+
     /** 清除指定会话全部记忆(短/中/长) */
     void clearSession(String sessionId, String userId);
 }

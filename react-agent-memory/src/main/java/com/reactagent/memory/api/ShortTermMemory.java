@@ -29,6 +29,13 @@ public interface ShortTermMemory {
     /** 取出旧消息用于压缩(保留最近 keepRecent 条,返回其余) */
     List<Msg> takeOldMessages(String sessionId, int keepRecent);
 
+    /**
+     * 删除会话中较早的消息,仅保留最近 keepRecent 条。
+     * 上下文压缩生成摘要后调用,真正收缩短期记忆。
+     * @return 实际删除条数
+     */
+    int deleteOlder(String sessionId, int keepRecent);
+
     /** 按会话维度清除短期记忆 */
     void clear(String sessionId);
 }

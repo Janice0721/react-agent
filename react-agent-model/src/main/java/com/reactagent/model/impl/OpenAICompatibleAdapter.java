@@ -8,6 +8,7 @@ import com.reactagent.core.msg.Msg;
 import com.reactagent.core.msg.Role;
 import com.reactagent.core.msg.Usage;
 import com.reactagent.core.msg.block.ContentBlock;
+import com.reactagent.core.msg.block.HintBlock;
 import com.reactagent.core.msg.block.TextBlock;
 import com.reactagent.core.msg.block.ThinkingBlock;
 import com.reactagent.core.msg.block.ToolCallBlock;
@@ -245,6 +246,16 @@ public class OpenAICompatibleAdapter implements ModelAdapter {
         for (ContentBlock block : blocks) {
             if (block instanceof TextBlock tb) {
                 textContent.append(tb.getText());
+            } else if (block instanceof HintBlock hb) {
+                // HintBlock(记忆/提示注入)也需让模型可见,带来源标签
+                String hint = hb.getHint();
+                if (hint != null && !hint.isBlank()) {
+                    String src = hb.getSource();
+                    textContent.append(src != null && !src.isBlank()
+                            ? "[" + src + "] " + hint
+                            : hint);
+                    textContent.append("\n");
+                }
             }
         }
         msgNode.put("content", textContent.toString());

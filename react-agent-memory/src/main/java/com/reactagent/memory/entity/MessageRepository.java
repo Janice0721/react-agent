@@ -86,4 +86,26 @@ public class MessageRepository {
     public void deleteBySession(String sessionId) {
         jdbcTemplate.update("DELETE FROM agent_message WHERE session_id = ?", sessionId);
     }
+
+    /**
+     * 删除会话中较早的消息,保留最近 keepRecent 条。
+     * 返回实际删除的条数。用于上下文压缩后真正收缩短期记忆。
+     */
+    public int deleteOlder(String sessionId, int keepRecent) {
+        int total = count(sessionId);
+        if (total <= keepRecent) return 0;
+        // 删除 created_at 不在最近 keepRecent 条范围内的消息
+        String sql = "DELETE FROM agent_message WHERE session_id = ? AND id NOT IN (" +
+                "SELECT id FROM (SELECT id FROM agent_message WHERE session_id = ? " +
+                "ORDER BY created_at DESC LIMIT ?) keep)";
+        return jdbcTemplate.update(sql, sessionId, sessionId, keepRecent);
+    }
+
+    /** 统计会话全部消息的 content 字段总字符数(用于 token 估算,DB 侧聚合) */
+    public int sumContentLength(String sessionId) {
+        Integer len = jdbcTemplate.queryForObject(
+            "SELECT COALESCE(SUM(CHAR_LENGTH(content)), 0) FROM agent_message WHERE session_id = ?",
+            Integer.class, sessionId);
+        return len != null ? len : 0;
+    }
 }
