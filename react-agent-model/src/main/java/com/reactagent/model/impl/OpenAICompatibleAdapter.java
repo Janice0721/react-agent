@@ -167,9 +167,10 @@ public class OpenAICompatibleAdapter implements ModelAdapter {
             body.put("tool_choice", "auto");
         }
 
-        // 技能列表(如果有)
+        // 技能概览注入 system prompt(不是放在请求体自定义字段,OpenAI API 不认)
         if (skills != null && !skills.isEmpty()) {
             StringBuilder sb = new StringBuilder();
+            sb.append("\n\n## 可用技能列表\n");
             sb.append("你可以使用以下技能,调用 load_skill 工具按需加载完整指令:\n");
             for (SkillMeta meta : skills) {
                 sb.append("  - ").append(meta.getName())
@@ -177,9 +178,22 @@ public class OpenAICompatibleAdapter implements ModelAdapter {
                         .append(" (使用场景: ").append(meta.getWhenToUse()).append(")\n");
             }
             sb.append("如果任务需要某个技能,先调用 load_skill 加载,再按指令执行。");
-            body.put("skills", sb.toString());
+
+            // 如果 messages 第一条是 system,追加到后面;否则新建 system 消息
+            String skillHint = sb.toString();
+            if (!messages.isEmpty() && messages.get(0).has("role")
+                    && "system".equals(messages.get(0).get("role").asText())) {
+                String existing = messages.get(0).path("content").asText("");
+                ((com.fasterxml.jackson.databind.node.ObjectNode) messages.get(0))
+                        .put("content", existing + skillHint);
+            } else {
+                ObjectNode sysMsg = objectMapper.createObjectNode();
+                sysMsg.put("role", "system");
+                sysMsg.put("content", skillHint.strip());
+                messages.insert(0, sysMsg);
+            }
         }
-        log.warn("请求体: {}", body.toString());
+        log.info("请求体构建完成,body: {}", body);
         return body;
     }
 

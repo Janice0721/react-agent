@@ -33,55 +33,6 @@ public class SkillRegistry {
      */
     private final Map<String, Skill> skills = new ConcurrentHashMap<>();
 
-    /**
-     * 内置技能目录(classpath)
-     */
-    @Value("${agent.skill.base-dir:skills}")
-    private String skillBaseDir;
-
-    /**
-     * 外部自定义技能目录(可选)
-     */
-    @Value("${agent.skill.external-dir:}")
-    private String externalDir;
-
-    @Autowired
-    private SkillLoader loader;
-
-
-    /**
-     * 技能模块 Spring 配置。
-     * <p>
-     * 启动时:
-     * 1. 从 classpath:skills/ 加载内置技能
-     * 2. 从外部目录(可选)加载用户自定义技能
-     * 3. 注册到 SkillRegistry
-     * 4. 注册 LoadSkillTool 到 ToolKit
-     */
-    @PostConstruct
-    public void init() {
-        // 1. 加载内置技能(classpath:skills/)
-        log.info("加载内置技能,目录: {}", skillBaseDir);
-        List<FileSkill> builtins = loader.loadFromDirectory(skillBaseDir);
-        builtins.forEach(this::register);
-
-        // 2. 加载外部自定义技能(如果配置了)
-        if (externalDir != null && !externalDir.isBlank()) {
-            Path extPath = Paths.get(externalDir.replace("~",
-                    System.getProperty("user.home")));
-            if (Files.isDirectory(extPath)) {
-                log.info("加载外部技能,目录: {}", extPath);
-                List<FileSkill> customs = loader.loadFromDirectory(extPath.toString());
-                customs.forEach(this::register);
-            } else {
-                log.warn("外部技能目录不存在: {}", extPath);
-            }
-        }
-
-        log.info("技能注册完成,共 {} 个: {}", this.listNames().size(), this.listNames());
-    }
-
-
 
     // ==================== 注册 / 注销 ====================
 

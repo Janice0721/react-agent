@@ -41,7 +41,7 @@ public class ReactAgentApplication {
     @PostConstruct
     public void init() {
 
-        ContentBlock contentBlock = new TextBlock("你好,帮我执行一下code review的skill");
+        ContentBlock contentBlock = new TextBlock("你好,帮我执行一下代码评审");
         Msg msg = Msg.user("1", "user", List.of(contentBlock));
         Mono<ModelResponse> call = modelAdapter.call(List.of(msg), toolkit.toFunctionSpecs(),skillRegistry.listMeta());
         call.subscribe(modelResponse -> {
