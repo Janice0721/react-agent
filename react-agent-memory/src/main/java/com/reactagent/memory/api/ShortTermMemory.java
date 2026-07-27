@@ -30,11 +30,10 @@ public interface ShortTermMemory {
     List<Msg> takeOldMessages(String sessionId, int keepRecent);
 
     /**
-     * 删除会话中较早的消息,仅保留最近 keepRecent 条。
-     * 上下文压缩生成摘要后调用,真正收缩短期记忆。
-     * @return 实际删除条数
+     * 按水位线取未摘要的尾巴:返回 created_at > watermark 的消息(正序)。
+     * watermark 为 null 时返回全部。用于 buildContext 与压缩判定。
      */
-    int deleteOlder(String sessionId, int keepRecent);
+    List<Msg> getAfter(String sessionId, String watermark);
 
     /** 按会话维度清除短期记忆 */
     void clear(String sessionId);

@@ -30,6 +30,7 @@ agent:
     compress-threshold: 8000
     compress-keep-recent: 6
     long-term-top-k: 5
+    session-summary-ttl: 7d   # 中期摘要 Redis 缓存 TTL(摘要本身持久化 MySQL)
     qdrant:
       host: 127.0.0.1
       port: 6334

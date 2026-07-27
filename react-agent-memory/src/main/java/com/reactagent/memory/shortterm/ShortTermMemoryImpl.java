@@ -2,8 +2,8 @@ package com.reactagent.memory.shortterm;
 
 import com.reactagent.core.msg.Msg;
 import com.reactagent.memory.api.ShortTermMemory;
-import com.reactagent.memory.entity.MessageEntity;
 import com.reactagent.memory.entity.MessageRepository;
+import com.reactagent.memory.entity.MessageEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -11,10 +11,11 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * 短期记忆实现:最近对话记录,按会话维度落库 MySQL。
+ * 短期记忆(消息历史)实现:按会话维度落库 MySQL。
  * <p>
- * 内存中不缓存(直接走 DB),保证重启后可恢复。
- * 可扩展:后续可加内存缓存层或换为分布式缓存。
+ * 这是 append-only 的最终消息历史,用于溯源/回放/审计,<b>永不删除</b>。
+ * 压缩只推进中期记忆的水位线,原文留存。
+ * 可扩展:后续可叠加内存缓存层或换为分布式存储。
  */
 @Component
 public class ShortTermMemoryImpl implements ShortTermMemory {
@@ -72,12 +73,10 @@ public class ShortTermMemoryImpl implements ShortTermMemory {
     }
 
     @Override
-    public int deleteOlder(String sessionId, int keepRecent) {
-        int deleted = repository.deleteOlder(sessionId, keepRecent);
-        if (deleted > 0) {
-            log.info("短期记忆压缩: session={} 删除 {} 条旧消息", sessionId, deleted);
-        }
-        return deleted;
+    public List<Msg> getAfter(String sessionId, String watermark) {
+        return repository.findAfter(sessionId, watermark).stream()
+                .map(MsgSerializer::toMsg)
+                .toList();
     }
 
     @Override

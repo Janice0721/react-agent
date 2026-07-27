@@ -60,14 +60,13 @@ public class MemoryManagerImpl implements MemoryManager {
     public List<Msg> buildContext(String sessionId, String userId, String currentQuery) {
         List<Msg> context = new ArrayList<>();
 
-        // 1. 注入中期记忆摘要(如果有) — 单条 system 消息
+        // 1. 中期记忆摘要(覆盖 [会话起点, watermark]) — 单条 system 消息
         String summaryText = midTerm.getSummaryText(sessionId);
         if (summaryText != null && !summaryText.isBlank()) {
-            Msg summaryMsg = Msg.system(sessionId, summaryText);
-            context.add(summaryMsg);
+            context.add(Msg.system(sessionId, summaryText));
         }
 
-        // 2. 注入长期记忆检索结果 — 合并为单条 system 消息(含多个 HintBlock)
+        // 2. 长期记忆语义检索 — 合并为单条 system 消息(含多个 HintBlock)
         if (currentQuery != null && !currentQuery.isBlank()) {
             try {
                 List<Msg> memories = longTerm.search(
@@ -95,9 +94,14 @@ public class MemoryManagerImpl implements MemoryManager {
             }
         }
 
-        // 3. 短期记忆(最近 N 条原文)
-        List<Msg> recent = shortTerm.getRecent(sessionId, properties.getShortTermLimit());
-        context.addAll(recent);
+        // 3. 短期记忆原文:未摘要的尾巴(getAfter(watermark)),超限时只取最近 N 条
+        String watermark = midTerm.getWatermark(sessionId);
+        List<Msg> tail = shortTerm.getAfter(sessionId, watermark);
+        int limit = properties.getShortTermLimit();
+        if (tail.size() > limit) {
+            tail = tail.subList(tail.size() - limit, tail.size());
+        }
+        context.addAll(tail);
 
         return context;
     }
@@ -173,19 +177,21 @@ public class MemoryManagerImpl implements MemoryManager {
      */
     @Override
     public boolean compressContext(String sessionId) {
-        int tokens = shortTerm.estimateTokens(sessionId);
-        if (tokens <= properties.getCompressThreshold()) {
-            return false;  // 未超阈值,不需要压缩
+        // 只压缩"未摘要的尾巴";agent_message 原文永不删除(溯源)
+        String watermark = midTerm.getWatermark(sessionId);
+        List<Msg> tail = shortTerm.getAfter(sessionId, watermark);
+        if (tail.size() <= properties.getCompressKeepRecent()) {
+            return false;  // 尾巴不够长,保留为原文
+        }
+        if (estimateTokens(tail) <= properties.getCompressThreshold()) {
+            return false;  // 未超阈值
         }
 
-        // 取出旧消息(保留最近 K 条)
-        List<Msg> oldMsgs = shortTerm.takeOldMessages(
-                sessionId, properties.getCompressKeepRecent());
-        if (oldMsgs.isEmpty()) return false;
-
+        // 摘要 tail 前半,保留最近 keepRecent 条原文
+        int keep = properties.getCompressKeepRecent();
+        List<Msg> toSummarize = tail.subList(0, tail.size() - keep);
         try {
-            // 调 LLM 生成摘要
-            String content = buildCompressionPrompt(oldMsgs);
+            String content = buildCompressionPrompt(toSummarize);
             Msg promptMsg = Msg.user(sessionId, "system",
                     "请将以下对话历史压缩为简洁的摘要,保留关键事实、决策和上下文。"
                     + "用自然语言描述,不要遗漏重要信息。\n\n" + content);
@@ -198,15 +204,14 @@ public class MemoryManagerImpl implements MemoryManager {
                         .id(UUID.randomUUID().toString())
                         .sessionId(sessionId)
                         .summary(response.getText())
-                        .fromTime(oldMsgs.get(0).getCreatedAt())
-                        .toTime(oldMsgs.get(oldMsgs.size() - 1).getCreatedAt())
+                        .fromTime(toSummarize.get(0).getCreatedAt())
+                        .toTime(toSummarize.get(toSummarize.size() - 1).getCreatedAt())
                         .createdAt(Instant.now().toString())
                         .build();
+                // 摘要落 MySQL+Redis,toTime 即新水位线;原文留存
                 midTerm.store(sessionId, summary);
-                // 摘要成功后才删除旧消息,避免压缩失败丢数据
-                int deleted = shortTerm.deleteOlder(sessionId, properties.getCompressKeepRecent());
-                log.info("上下文压缩: session={} 旧消息={} 摘要已存入中期记忆,删除短期记忆 {} 条",
-                        sessionId, oldMsgs.size(), deleted);
+                log.info("上下文压缩: session={} 摘要 {} 条原文(原文留存),水位线推进到 {}",
+                        sessionId, toSummarize.size(), summary.getToTime());
                 return true;
             }
             return false;
@@ -217,6 +222,16 @@ public class MemoryManagerImpl implements MemoryManager {
     }
 
     // ==================== 内部方法 ====================
+
+    /** 估算一组消息的 token 数(粗略:文本字符数/4),用于压缩判定。 */
+    private int estimateTokens(List<Msg> msgs) {
+        int chars = 0;
+        for (Msg m : msgs) {
+            String t = m.getTextContent();
+            if (t != null) chars += t.length();
+        }
+        return chars / 4;
+    }
 
     private String buildExtractionPrompt(List<Msg> msgs) {
         StringBuilder sb = new StringBuilder();

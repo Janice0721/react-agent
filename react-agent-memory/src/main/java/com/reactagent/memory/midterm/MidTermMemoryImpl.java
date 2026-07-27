@@ -3,6 +3,8 @@ package com.reactagent.memory.midterm;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reactagent.memory.api.MidTermMemory;
+import com.reactagent.memory.config.MemoryProperties;
+import com.reactagent.memory.entity.SessionSummaryRepository;
 import com.reactagent.memory.model.MemorySummary;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,13 +16,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 中期记忆实现:Redis 存储,会话级摘要。
+ * 中期记忆实现:会话级摘要,Redis 缓存 + MySQL 持久化。
  * <p>
- * Key 设计:
- * <ul>
- *   <li>session:{sessionId}:midterm → 摘要列表 JSON</li>
- * </ul>
- * TTL: 24 小时(可配置)。
+ * 真相源在 MySQL(session_summary 表),Redis 仅作缓存:<br>
+ *   - store: MySQL 落库 + 刷新 Redis(带 TTL)<br>
+ *   - get: 先读 Redis,miss 回查 MySQL 并回填缓存<br>
+ *   - clear: 删 MySQL + 删 Redis<br>
+ * 这样 TTL 不再是"数据丢失定时器",缓存过期可从 MySQL 重建。<br>
+ * Key: session:{sessionId}:midterm → 摘要列表 JSON
  */
 @Component
 public class MidTermMemoryImpl implements MidTermMemory {
@@ -28,48 +31,66 @@ public class MidTermMemoryImpl implements MidTermMemory {
     private static final Logger log = LoggerFactory.getLogger(MidTermMemoryImpl.class);
     private static final String KEY_PREFIX = "session:";
     private static final String KEY_SUFFIX = ":midterm";
-    private static final Duration DEFAULT_TTL = Duration.ofHours(24);
 
     private final StringRedisTemplate redisTemplate;
+    private final SessionSummaryRepository repository;
+    private final MemoryProperties properties;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public MidTermMemoryImpl(StringRedisTemplate redisTemplate) {
+    public MidTermMemoryImpl(StringRedisTemplate redisTemplate,
+                             SessionSummaryRepository repository,
+                             MemoryProperties properties) {
         this.redisTemplate = redisTemplate;
+        this.repository = repository;
+        this.properties = properties;
     }
 
     private String key(String sessionId) {
         return KEY_PREFIX + sessionId + KEY_SUFFIX;
     }
 
+    private Duration ttl() {
+        Duration t = properties.getSessionSummaryTtl();
+        return t != null ? t : Duration.ofDays(7);
+    }
+
     @Override
     public void store(String sessionId, MemorySummary summary) {
+        // 1. 落库 MySQL(真相源)
+        repository.save(summary);
+        // 2. 刷新 Redis 缓存(读现有库内全部 + 写回,保证缓存与库一致)
         try {
-            String k = key(sessionId);
-            // 读取现有列表
-            List<MemorySummary> list = get(sessionId);
-            list.add(summary);
-            // 写回
-            String json = objectMapper.writeValueAsString(list);
-            redisTemplate.opsForValue().set(k, json, DEFAULT_TTL);
-            log.debug("中期记忆存储: session={} 摘要数={}", sessionId, list.size());
+            List<MemorySummary> all = repository.findAll(sessionId);
+            redisTemplate.opsForValue().set(key(sessionId),
+                    objectMapper.writeValueAsString(all), ttl());
+            log.debug("中期记忆存储: session={} 摘要数={}", sessionId, all.size());
         } catch (Exception e) {
-            log.error("中期记忆存储失败: session={}", sessionId, e);
+            log.error("中期记忆刷新缓存失败(库已落): session={}", sessionId, e);
         }
     }
 
     @Override
     public List<MemorySummary> get(String sessionId) {
+        // 1. 先读 Redis
         try {
-            String k = key(sessionId);
-            String json = redisTemplate.opsForValue().get(k);
-            if (json == null || json.isBlank()) {
-                return new ArrayList<>();
+            String json = redisTemplate.opsForValue().get(key(sessionId));
+            if (json != null && !json.isBlank()) {
+                return objectMapper.readValue(json, new TypeReference<List<MemorySummary>>() {});
             }
-            return objectMapper.readValue(json, new TypeReference<List<MemorySummary>>() {});
         } catch (Exception e) {
-            log.error("中期记忆读取失败: session={}", sessionId, e);
-            return new ArrayList<>();
+            log.warn("中期记忆读缓存失败,回查 MySQL: session={}", sessionId);
         }
+        // 2. miss 回查 MySQL 并回填缓存
+        List<MemorySummary> all = repository.findAll(sessionId);
+        if (!all.isEmpty()) {
+            try {
+                redisTemplate.opsForValue().set(key(sessionId),
+                        objectMapper.writeValueAsString(all), ttl());
+            } catch (Exception e) {
+                log.warn("中期记忆回填缓存失败: session={}", sessionId);
+            }
+        }
+        return all;
     }
 
     @Override
@@ -89,7 +110,13 @@ public class MidTermMemoryImpl implements MidTermMemory {
     }
 
     @Override
+    public String getWatermark(String sessionId) {
+        return repository.getWatermark(sessionId);
+    }
+
+    @Override
     public void clear(String sessionId) {
+        repository.deleteBySession(sessionId);
         redisTemplate.delete(key(sessionId));
         log.info("清除中期记忆: session={}", sessionId);
     }

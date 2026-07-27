@@ -16,15 +16,15 @@
 ├───────────────────────────────────────────────────────┤
 │                                                       │
 │  ┌─────────────────┐  buildContext() 注入             │
-│  │ 短期记忆 ShortTerm│  最近对话原文                    │
-│  │ MySQL 落库       │  按会话维度持久化                  │
+│  │ 短期记忆 ShortTerm│  最近对话原文(append-only 永不删除)│
+│  │ MySQL 落库       │  按会话维度持久化,溯源/回放        │
 │  │ agent_message 表 │  重启可恢复                       │
 │  └─────────────────┘                                  │
 │                                                       │
 │  ┌─────────────────┐  buildContext() 注入             │
 │  │ 中期记忆 MidTerm │  会话级摘要                       │
-│  │ Redis 存储       │  旧消息 LLM 压缩后存此             │
-│  │ TTL 24h          │  超阈值自动触发压缩               │
+│  │ MySQL+Redis      │  旧消息 LLM 压缩后存此(库+缓存)   │
+│  │ TTL 可配(默认7天) │  超阈值自动触发压缩,推进水位线    │
 │  └─────────────────┘                                  │
 │                                                       │
 │  ┌─────────────────┐  buildContext() 语义检索注入      │
@@ -78,7 +78,7 @@ com.reactagent.memory
 | `estimateTokens(sessionId)` | 估算当前会话 token 数 |
 | `consolidate(sessionId, userId, finalReply)` | 会话结束沉淀：LLM 提取关键信息 → 存 Qdrant |
 | `clearSession(sessionId, userId)` | 清除会话全部记忆（短/中/长） |
-| `compressContext(sessionId)` → `boolean` | 上下文压缩：token 超阈值 → 旧消息 LLM 摘要 → 存 Redis → 删除已摘要短期消息；返回是否触发 |
+| `compressContext(sessionId)` → `boolean` | 上下文压缩：token 超阈值 → 旧消息 LLM 摘要 → 存 MySQL+Redis → **推进水位线（原文留存，可溯源）**；返回是否触发 |
 
 ### ShortTermMemory（短期记忆）
 
@@ -90,7 +90,7 @@ com.reactagent.memory
 | `count(sessionId)` | 消息总数 |
 | `estimateTokens(sessionId)` | token 估算（DB 侧 SUM 字符数/4，避免全量加载） |
 | `takeOldMessages(sessionId, keepRecent)` | 取出旧消息（不删除，用于压缩前预览） |
-| `deleteOlder(sessionId, keepRecent)` | 删除较早消息仅保留最近 keepRecent 条（压缩后真正收缩上下文） |
+| `getAfter(sessionId, watermark)` | 按水位线取未摘要的尾巴（正序）；watermark=null 返回全部，用于 buildContext 与压缩判定 |
 | `clear(sessionId)` | 清除会话消息 |
 
 ### MidTermMemory（中期记忆）
@@ -135,7 +135,7 @@ CREATE TABLE agent_message (
 ### Redis Key（中期记忆）
 
 ```
-session:{sessionId}:midterm  →  摘要列表 JSON  (TTL 24h)
+session:{sessionId}:midterm  →  摘要列表 JSON  (Redis 缓存, TTL 可配默认 7d;真相源 MySQL session_summary 表)
 ```
 
 ### Qdrant Collection（长期记忆）
@@ -227,7 +227,7 @@ public class MyService {
         memoryManager.addShortTerm(reply);
 
         // 5. 上下文过长时压缩（token 超阈值自动触发）
-        //    旧消息 → LLM 摘要 → 存 Redis 中期记忆 → 删除已摘要的短期消息
+        //    旧消息 → LLM 摘要 → 存 MySQL+Redis → 推进水位线(agent_message 原文留存)
         if (memoryManager.estimateTokens(sessionId) > 8000) {
             memoryManager.compressContext(sessionId);   // 已在接口,无需强转;返回是否触发
         }
@@ -311,8 +311,7 @@ public class MyService {
 
 - **现象**：`compressContext` 取出旧消息生成摘要存入中期记忆后，**没有删除**短期记忆中的旧消息 → 上下文只增不减，长任务上下文压缩失效。
 - **修复**：
-  - `MessageRepository` / `ShortTermMemory` 新增 `deleteOlder(sessionId, keepRecent)`。
-  - `compressContext` 摘要成功后才调用 `deleteOlder`，避免压缩失败丢数据。
+  - ~~`deleteOlder`（已废弃并移除）~~：本轮发现压缩时删除原文会破坏溯源，改为水位线机制，见下方「分类重构」记录。
   - `compressContext` 返回值改为 `boolean`（是否触发压缩），并提升到 `MemoryManager` 接口（原为 impl 的 public 方法，运行时无法通过接口调用）。
 - **回归测试**：`testShortTermDeleteOlder`、`testCompressContextNoOp`。
 
@@ -358,3 +357,59 @@ mvn -pl react-agent-model test -Dtest=HintBlockSerializationTest -Dsurefire.fail
 - 短期记忆可叠加内存缓存层（Caffeine）减少 DB 压力。
 - `consolidate()` 尚无自动化测试（需真实 LLM 调用），建议后续补 Mock 测试。
 - 向中心化记忆服务演进时，`MemoryManager` 实现改为 HTTP/gRPC 客户端即可。
+
+
+## 分类重构（2026-07-27 第二轮，根治"分类混乱"）
+
+上一轮用 `deleteOlder` 删原文来做压缩，破坏了溯源。本轮按"职责"而非"介质"重新理清四层，根治该问题。
+
+### 核心纠正：短期记忆 = append-only 消息历史，永不删除
+
+- `agent_message` 是**最终消息历史**，用于溯源/回放/审计，压缩**绝不删除**。
+- 压缩只推进中期记忆的**水位线**，原文留存。
+
+### 中期记忆：MySQL 持久化 + Redis 缓存，TTL 可配
+
+- 新增 `session_summary` 表（`session_summary_repository`），摘要是**真相源在 MySQL**。
+- `MidTermMemoryImpl` 改为双写：store → MySQL 落库 + 刷新 Redis；get → Redis miss 回查 MySQL 并回填。
+- TTL 从硬编码 24h 改为可配 `agent.memory.session-summary-ttl`（默认 7d）。TTL 现在只是缓存过期，不是数据丢失定时器。
+
+### 水位线机制（替代删除）
+
+- `MidTermMemory.getWatermark(sessionId)` 返回最近一次摘要覆盖到的消息 `created_at`。
+- `ShortTermMemory.getAfter(sessionId, watermark)` 返回未摘要的尾巴。
+- `buildContext`：摘要(覆盖[起点,watermark]) + `getAfter(watermark)` 原文尾巴，不重复、不丢失。
+- `compressContext`：取尾巴前半 LLM 摘要 → `to_time` 即新水位线 → 原文留存。
+
+### 新增表/接口
+
+| 项 | 说明 |
+|---|---|
+| `session_summary` 表 | 中期记忆持久化(id/session_id/summary/key_points/from_time/to_time/created_at) |
+| `SessionSummaryRepository` | JDBC，save/findAll/getWatermark/deleteBySession |
+| `MidTermMemory.getWatermark` | 返回会话水位线 |
+| `ShortTermMemory.getAfter` | 按水位线取未摘要尾巴 |
+| `MemoryProperties.sessionSummaryTtl` | Redis 缓存 TTL，默认 7d |
+
+### 长期记忆写入触发（待 runtime 接入）
+
+`consolidate()` 已实现但尚未被调用。runtime 启动后应在以下触发点接入：
+- 显式结束会话（`endSession`）
+- 空闲超时（后台扫描活跃会话）
+- 显式"记住这个"
+- 周期提取（每 N 轮 / token 达阈值）
+
+### 测试
+
+14 个集成测试 + 2 个适配器单元测试全过。新增覆盖：
+- `testShortTermGetAfter` — 水位线取尾巴
+- `testMidTermCacheRebuildFromDb` — Redis 清空后从 MySQL 重建
+- `testCompressKeepsHistory` — 压缩前后 `agent_message` 条数不变（溯源不变量）
+- `testMidTermWatermark` — 水位线接口可用
+
+### 后续可继续优化
+
+- `MsgSerializer` 手动解析 → `@JsonTypeInfo` 多态。
+- 短期记忆叠加 Caffeine 内存缓存层。
+- `consolidate()` 补 Mock 自动化测试。
+- 演进为中心化记忆服务时，四层实现各自改为 HTTP/gRPC 客户端。

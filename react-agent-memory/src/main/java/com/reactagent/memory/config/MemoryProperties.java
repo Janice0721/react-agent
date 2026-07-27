@@ -4,6 +4,8 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+
 /**
  * 记忆模块配置属性。
  */
@@ -23,6 +25,9 @@ public class MemoryProperties {
 
     /** 长期记忆:检索 top-k */
     private int longTermTopK = 5;
+
+    /** 中期记忆(会话摘要)Redis 缓存 TTL,默认 7 天;摘要本身持久化到 MySQL,缓存丢失可回查 */
+    private Duration sessionSummaryTtl = Duration.ofDays(7);
 
     /** Qdrant 配置 */
     private Qdrant qdrant = new Qdrant();

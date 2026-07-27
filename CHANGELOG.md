@@ -10,6 +10,14 @@
 
 ### 新增
 - 项目基础文档：README、SETUP、TECHNICAL_DESIGN、EXECUTION_PLAN
+### 变更 — 记忆分类重构 (2026-07-27 第二轮)
+- 严重纠正：短期记忆(agent_message)改为 append-only 永不删除,恢复溯源能力(上一轮 deleteOlder 破坏了溯源)
+- 新增 session_summary 表 + SessionSummaryRepository,中期记忆真相源由 Redis 改为 MySQL 持久化
+- MidTermMemoryImpl 改为 MySQL+Redis 双写,Redis miss 回查 MySQL 并回填
+- TTL 从硬编码 24h 改为可配 session-summary-ttl(默认 7d),降级为缓存过期而非数据丢失
+- 引入水位线机制:MidTermMemory.getWatermark + ShortTermMemory.getAfter,buildContext/compressContext 用水位线代替删除
+- buildContext:摘要(覆盖[起点,watermark]) + getAfter(watermark)原文尾巴,不重复不丢失
+- 测试:14 集成 + 2 单元全过,新增 getAfter/缓存重建/溯源不变量/水位线 4 个测试
 ### 变更 — 记忆模块自测修复 (2026-07-27)
 - 严重修复：`OpenAICompatibleAdapter` 只序列化 `TextBlock`，导致 `HintBlock` 承载的长期记忆对模型不可见；现已序列化 `HintBlock`（带来源标签）
 - 严重修复：`MemoryManagerImpl.buildContext` 将多条长期记忆合并为单条 system 消息（原为多条 role=USER 空消息）

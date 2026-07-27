@@ -26,3 +26,17 @@ CREATE TABLE IF NOT EXISTS agent_session (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话表';
+
+-- 会话摘要表(中期记忆持久化)
+-- 压缩时旧消息 → LLM 摘要 → 落库此表;agent_message 原文永不删除(溯源)
+-- watermark = 最近一次摘要覆盖到的消息 created_at,getAfter(watermark) 取未摘要尾巴
+CREATE TABLE IF NOT EXISTS session_summary (
+    id              VARCHAR(64) PRIMARY KEY COMMENT '摘要ID',
+    session_id      VARCHAR(64) NOT NULL COMMENT '所属会话ID',
+    summary         TEXT NOT NULL COMMENT '摘要文本',
+    key_points      TEXT COMMENT '关键事实/决策点',
+    from_time       VARCHAR(40) COMMENT '覆盖消息时间范围起(ISO8601)',
+    to_time         VARCHAR(40) COMMENT '覆盖消息时间范围止(ISO8601)=水位线',
+    created_at      VARCHAR(40) NOT NULL COMMENT '摘要创建时间',
+    INDEX idx_session_created (session_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话摘要表(中期记忆持久化)';
